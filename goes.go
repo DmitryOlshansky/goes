@@ -104,8 +104,6 @@ func (this EsConn) Bulk(typeName string, bulk []string) (err error) {
 	bodyStr := strings.Join(bulk, "")
 	body := bytes.NewBufferString(bodyStr)
 	url := fmt.Sprintf("%s%s/%s/_bulk", this.hostPrefix, this.path, typeName)
-	log.Print("Bulk: ", url)
-	log.Print("Bulk body: ", bodyStr)
 	request, err := http.NewRequest("PUT", url, body)
 	if err != nil {
 		return err
@@ -140,7 +138,7 @@ func (this EsConn) PutIndex(metaString string) (string, error) {
 	for k := range meta[oldIndexName].Mappings {
 		typeName = k
 	}
-	log.Printf("Transfering index `%s`", oldIndexName)
+	log.Printf("Transfering index `%s` type `%s`", oldIndexName, typeName)
 	// metaBlob - all index meta data
 	metaBlob, err := json.Marshal(meta[oldIndexName])
 	if err != nil {
@@ -229,7 +227,8 @@ func exportTask(p Params) error {
 	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
 		log.Printf("Got %d docs.\n", len(hits))
 		for _, h := range hits {
-			id := fmt.Sprintf("{ \"index\" : { \"_id\" : \"%v\" } }\n", h["_id"])
+			// create is faster then index but must avoid collision (index is empty at start)
+			id := fmt.Sprintf("{ \"create\" : { \"_id\" : \"%v\" } }\n", h["_id"])
 			io.WriteString(sink, id)
 			bytes, err := json.Marshal(h["_source"])
 			if err != nil {
@@ -279,6 +278,7 @@ func importTask(p Params) (err error) {
 		}
 		batch = append(batch, item)
 		if len(batch) == p.window*2 {
+			log.Printf("Imported %d", p.window)
 			es.Bulk(typeName, batch)
 			batch = batch[:0]
 		}
@@ -286,9 +286,53 @@ func importTask(p Params) (err error) {
 	return
 }
 
-func copyTask(p Params) error {
+func copyTask(p Params) (err error) {
 	log.Printf("Copy %s --> %s\n", p.in, p.out)
-	return nil
+	es1, err := ConnectES(p.in)
+	if err != nil {
+		return
+	}
+	es2, err := ConnectES(p.out)
+	if err != nil {
+		return
+	}
+	index, err := es1.GetIndex()
+	if err != nil {
+		return
+	}
+	if p.force {
+		err = es2.DeleteIndex()
+		if err != nil {
+			return
+		}
+	}
+	typeName, err := es2.PutIndex(index)
+
+	scroll, err := es1.NewScroll(p.window)
+	if err != nil {
+		return err
+	}
+
+	var batch []string
+	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
+		log.Printf("Got %d docs.\n", len(hits))
+		for _, h := range hits {
+			id := fmt.Sprintf("{ \"create\" : { \"_id\" : \"%v\" } }\n", h["_id"])
+			batch = append(batch, id)
+			bytes, err := json.Marshal(h["_source"])
+			if err != nil {
+				return err
+			}
+			batch = append(batch, string(bytes)+"\n")
+		}
+		err = es2.Bulk(typeName, batch)
+		batch = batch[:0]
+		if err != nil {
+			return err
+		}
+		log.Printf("Put %d docs.\n", len(hits))
+	}
+	return
 }
 
 type Params struct {
