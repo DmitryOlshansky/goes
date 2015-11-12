@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -49,7 +50,7 @@ func readRequest(client *http.Client, req *http.Request) (body []byte, err error
 		return
 	}
 	if resp.StatusCode >= 300 {
-		log.Fatalf("Http error[%s]: %s", resp.Status, string(body))
+		err = errors.New(fmt.Sprintf("Http error[%s]: %s", resp.Status, string(body)))
 	}
 	return
 }
@@ -301,10 +302,7 @@ func copyTask(p Params) (err error) {
 		return
 	}
 	if p.force {
-		err = es2.DeleteIndex()
-		if err != nil {
-			return
-		}
+		_ = es2.DeleteIndex()
 	}
 	typeName, err := es2.PutIndex(index)
 
