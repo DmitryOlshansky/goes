@@ -94,7 +94,7 @@ func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err err
             "size": %d
         }
     `, size)
-	url := fmt.Sprintf("%s%s/%s/_search?search_type=scan&scroll=1m", this.hostPrefix, this.path, typeName)
+	url := fmt.Sprintf("%s%s/%s/_search?search_type=scan&scroll=5m", this.hostPrefix, this.path, typeName)
 	request, err := http.NewRequest("GET", url, bytes.NewBufferString(query))
 	if err != nil {
 		return
@@ -265,7 +265,7 @@ func (this *EsConn) StreamTo(window int, dest chan []string) (err error) {
 	for _, t := range this.types {
 		err = this.readBulk(t, window, dest)
 		if err != nil {
-			return
+			panic(err)
 		}
 	}
 	return
@@ -297,7 +297,6 @@ func Reader(src *bufio.Reader, window int, dest chan []string) {
 			batch = batch[:0]
 		}
 	}
-
 }
 
 func Writer(src chan []string, sink io.Writer) (err error) {
