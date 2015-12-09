@@ -73,6 +73,32 @@ func readRequest(client *http.Client, req *http.Request) (body []byte, err error
 	return
 }
 
+// list of _id's failed with anything but document exists
+func parseBulkFailures(resp []byte) ([]string, error) {
+	var respObj struct {
+		Errors bool `json:"errors"`
+		Items  []struct {
+			Create struct {
+				Id     string `json:"_id"`
+				Status int    `json:"status"`
+			} `json:"create"`
+		} `json:"items"`
+	}
+	err := json.Unmarshal(resp, &respObj)
+	if err != nil {
+		return nil, err
+	}
+	fails := []string{}
+	if respObj.Errors {
+		for _, item := range respObj.Items {
+			if item.Create.Status != 201 {
+				fails = append(fails, item.Create.Id)
+			}
+		}
+	}
+	return fails, nil
+}
+
 func ConnectES(url string) (*EsConn, error) {
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		url = "http://" + url
@@ -128,7 +154,17 @@ func (this *EsConn) Bulk(bulk []string) (err error) {
 	if err != nil {
 		return err
 	}
-	_, err = readRequest(this.client, request)
+	resp, err := readRequest(this.client, request)
+	if err != nil {
+		return
+	}
+	fails, err := parseBulkFailures(resp)
+	if err != nil {
+		return
+	}
+	if len(fails) > 0 {
+		log.Printf("Failures: %v\n", fails)
+	}
 	return
 }
 
@@ -142,7 +178,6 @@ func (this *EsConn) DeleteIndex() (err error) {
 	return
 }
 
-// Returns name of the first type in the mapping (that's what we use - FIXME for more general ways)
 func (this *EsConn) PutIndex(metaString string, repls int, shards int) (err error) {
 	// meta - all metadata including the old index name (top-level)
 	meta := make(map[string]Index)
@@ -160,6 +195,7 @@ func (this *EsConn) PutIndex(metaString string, repls int, shards int) (err erro
 	}
 	log.Printf("Types %s", this.types)
 	metaVal := meta[oldIndexName]
+	metaVal.Aliases = map[string]Any{} // clear all aliases
 	// metaBlob - all index meta data
 	if repls >= 0 {
 		metaVal.Settings.Index.NumRepls = strconv.Itoa(repls)
@@ -172,6 +208,7 @@ func (this *EsConn) PutIndex(metaString string, repls int, shards int) (err erro
 	if err != nil {
 		return
 	}
+
 	reqMapping, err := http.NewRequest("PUT", this.hostPrefix+this.path, bytes.NewBuffer(metaBlob))
 	if err != nil {
 		return
@@ -207,15 +244,23 @@ func (this *EsConn) GetIndex() (string, error) {
 	for k := range meta[indexName].Mappings {
 		this.types = append(this.types, k)
 	}
+	metaVal := meta[indexName]
+	// clear aliases
+	metaVal.Aliases = map[string]Any{} // clear all aliases
+	meta[indexName] = metaVal
 	log.Printf("%v", this.types)
 	if resp.StatusCode >= 400 {
 		log.Fatalf("Elastic error[%s]: %s", resp.Status, string(data))
+	}
+	data, err = json.Marshal(meta)
+	if err != nil {
+		return "", err
 	}
 	return string(data), nil
 }
 
 func (this Scroll) Next() ([]map[string]Any, error) {
-	resp, err := this.es.client.Get(this.es.hostPrefix + "/_search/scroll?scroll=1m&scroll_id=" + this.id)
+	resp, err := this.es.client.Get(this.es.hostPrefix + "/_search/scroll?scroll=5m&scroll_id=" + this.id)
 	if err != nil {
 		return nil, err
 	}
@@ -241,9 +286,10 @@ func (this *EsConn) readBulk(typeName string, window int, dest chan []string) er
 	if err != nil {
 		return err
 	}
-	var batch []string
+
 	template := `{ "create" : { "_id" : "%v", "_type": "%v" } }` + "\n%s\n"
 	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
+		batch := []string{}
 		log.Printf("Exported %d\n", len(hits))
 		for _, h := range hits {
 			bytes, err := json.Marshal(h["_source"])
@@ -255,7 +301,6 @@ func (this *EsConn) readBulk(typeName string, window int, dest chan []string) er
 			batch = append(batch, bulk)
 		}
 		dest <- batch
-		batch = batch[:0]
 	}
 	return nil
 }
@@ -275,26 +320,28 @@ func (this *EsConn) AcceptFrom(src chan []string) (err error) {
 	for batch := range src {
 		err = this.Bulk(batch)
 		if err != nil {
-			return
+			panic(err)
 		}
-		log.Printf("Imported %d", len(batch)/2)
+		log.Printf("Imported %d", len(batch))
 	}
 	return
 }
 
 func Reader(src *bufio.Reader, window int, dest chan []string) {
-	batch := []string{}
 	defer close(dest)
+	batch := []string{}
 	for {
 		item, err := src.ReadString('\n')
 		if err == io.EOF {
-			dest <- batch
+			if len(batch) > 0 {
+				dest <- batch
+			}
 			break
 		}
 		batch = append(batch, item)
 		if len(batch) == window*2 {
 			dest <- batch
-			batch = batch[:0]
+			batch = []string{}
 		}
 	}
 }
@@ -356,10 +403,7 @@ func importTask(p Params) (err error) {
 		return
 	}
 	if p.force {
-		err = es.DeleteIndex()
-		if err != nil {
-			return
-		}
+		_ = es.DeleteIndex()
 	}
 	err = es.PutIndex(index, p.repls, p.shards)
 	if err != nil {
@@ -388,6 +432,9 @@ func copyTask(p Params) (err error) {
 		_ = es2.DeleteIndex()
 	}
 	err = es2.PutIndex(index, p.repls, p.shards)
+	if err != nil {
+		return
+	}
 	pipe := make(chan []string, 10)
 	go es1.StreamTo(p.window, pipe)
 	return es2.AcceptFrom(pipe)
