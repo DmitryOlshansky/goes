@@ -1,32 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
 	//	"github.com/davecheney/profile"
-	"io"
-	"io/ioutil"
 	"log"
-	"net/http"
-	neturl "net/url"
 	"os"
-	"strconv"
-	"strings"
 )
 
 type Any interface{}
-
-// Connection to a specific index in ES
-type EsConn struct {
-	hostPrefix string
-	path       string
-	types      []string
-	client     *http.Client
-}
 
 // ES scroll state - base64 of Id + connection
 type Scroll struct {
@@ -40,6 +21,33 @@ type Index struct {
 	Mappings map[string]Any `json:"mappings"`
 	Settings IndexSettings  `json:"settings"`
 	Warmers  map[string]Any `json:"warmers"`
+}
+
+// ES Bulk op
+type Bulk struct {
+	Id   string
+	Type string
+	Doc  []byte
+}
+
+type Batcher struct {
+	batch []Bulk
+	size  int
+	dest  chan<- []Bulk
+}
+
+func (this *Batcher) Put(b Bulk) {
+	this.batch = append(this.batch, b)
+	if len(this.batch) == this.size {
+		this.Flush()
+	}
+}
+
+func (this *Batcher) Flush() {
+	if len(this.batch) != 0 {
+		this.dest <- this.batch
+		this.batch = []Bulk{}
+	}
 }
 
 type IndexSettings struct {
@@ -56,309 +64,40 @@ type IndexSettings struct {
 	} `json:"index"`
 }
 
-// http helper - check status and read the whole response body
-func readRequest(client *http.Client, req *http.Request) (body []byte, err error) {
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	body, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	if resp.StatusCode >= 300 {
-		err = errors.New(fmt.Sprintf("Http error[%s]: %s", resp.Status, string(body)))
-	}
-	return
+type DataSource interface {
+	GetIndex() (string, error)
+	StreamTo(window int, dest chan []Bulk)
 }
 
-// list of _id's failed with anything but document exists
-func parseBulkFailures(resp []byte) ([]string, error) {
-	var respObj struct {
-		Errors bool `json:"errors"`
-		Items  []struct {
-			Create struct {
-				Id     string `json:"_id"`
-				Status int    `json:"status"`
-			} `json:"create"`
-		} `json:"items"`
-	}
-	err := json.Unmarshal(resp, &respObj)
-	if err != nil {
-		return nil, err
-	}
-	fails := []string{}
-	if respObj.Errors {
-		for _, item := range respObj.Items {
-			if item.Create.Status != 201 {
-				fails = append(fails, item.Create.Id)
-			}
-		}
-	}
-	return fails, nil
+type DataSink interface {
+	PutIndex(meta string, repls, shards int) error
+	DeleteIndex() error
+	AcceptFrom(src chan []Bulk) error
 }
 
-func ConnectES(url string) (*EsConn, error) {
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		url = "http://" + url
-	}
-	u, err := neturl.ParseRequestURI(url)
-	if err != nil {
-		return nil, err
-	}
-	hostPrefix := fmt.Sprintf("http://%s", u.Host)
-	return &EsConn{hostPrefix: hostPrefix, path: u.Path, client: http.DefaultClient}, nil
+type DataFlow interface {
+	DataSink
+	DataSource
 }
 
-func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err error) {
-	query := fmt.Sprintf(`
-        {
-            "query": {
-            	"match_all": {}
-            },
-            "size": %d
-        }
-    `, size)
-	url := fmt.Sprintf("%s%s/%s/_search?search_type=scan&scroll=5m", this.hostPrefix, this.path, typeName)
-	request, err := http.NewRequest("GET", url, bytes.NewBufferString(query))
-	if err != nil {
-		return
-	}
-	resp, err := readRequest(this.client, request)
-	if err != nil {
-		return
-	}
-	//
-	getScrollId := func(data []byte) (string, error) {
-		v := struct {
-			ScrollID string `json:"_scroll_id"`
-		}{}
-		err := json.Unmarshal(data, &v)
-		return v.ScrollID, err
-	}
-
-	scrollID, err := getScrollId(resp)
-	if err != nil {
-		return
-	}
-	scroll = Scroll{id: scrollID, es: this}
-	return
-}
-
-func (this *EsConn) Bulk(bulk []string) (err error) {
-	bodyStr := strings.Join(bulk, "")
-	body := bytes.NewBufferString(bodyStr)
-	url := fmt.Sprintf("%s%s/_bulk", this.hostPrefix, this.path)
-	request, err := http.NewRequest("PUT", url, body)
+func Copy(src DataSource, sink DataSink, p Params) error {
+	index, err := src.GetIndex()
 	if err != nil {
 		return err
 	}
-	resp, err := readRequest(this.client, request)
-	if err != nil {
-		return
+	if p.force {
+		sink.DeleteIndex()
 	}
-	fails, err := parseBulkFailures(resp)
-	if err != nil {
-		return
-	}
-	if len(fails) > 0 {
-		log.Printf("Failures: %v\n", fails)
-	}
-	return
-}
-
-// delete index of EsConn
-func (this *EsConn) DeleteIndex() (err error) {
-	req, err := http.NewRequest("DELETE", this.hostPrefix+this.path, bytes.NewReader([]byte{}))
-	if err != nil {
-		return
-	}
-	_, err = readRequest(this.client, req)
-	return
-}
-
-func (this *EsConn) PutIndex(metaString string, repls int, shards int) (err error) {
-	// meta - all metadata including the old index name (top-level)
-	meta := make(map[string]Index)
-	err = json.Unmarshal([]byte(metaString), &meta)
-	if err != nil {
-		return
-	}
-	var oldIndexName string
-	for k := range meta { // FIXME: iterating over map of 1 item to get the only key ?
-		oldIndexName = k
-	}
-	this.types = nil
-	for k := range meta[oldIndexName].Mappings {
-		this.types = append(this.types, k)
-	}
-	log.Printf("Types %s", this.types)
-	metaVal := meta[oldIndexName]
-	metaVal.Aliases = map[string]Any{} // clear all aliases
-	// metaBlob - all index meta data
-	if repls >= 0 {
-		metaVal.Settings.Index.NumRepls = strconv.Itoa(repls)
-	}
-	if repls >= 0 {
-		metaVal.Settings.Index.NumShards = strconv.Itoa(shards)
-	}
-
-	metaBlob, err := json.Marshal(metaVal)
-	if err != nil {
-		return
-	}
-
-	reqMapping, err := http.NewRequest("PUT", this.hostPrefix+this.path, bytes.NewBuffer(metaBlob))
-	if err != nil {
-		return
-	}
-	_, err = readRequest(this.client, reqMapping)
-	return
-}
-
-func (this *EsConn) GetIndex() (string, error) {
-	resp, err := this.client.Get(this.hostPrefix + this.path)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	meta := make(map[string]Index)
-	err = json.Unmarshal(data, &meta)
-	if err != nil {
-		return "", err
-	}
-	indexName := ""
-	for k := range meta { // FIXME: iterating over map of 1 item to get the only key ?
-		indexName = k
-	}
-	if err != nil {
-		return "", err
-	}
-	this.types = nil
-	log.Print(indexName)
-	for k := range meta[indexName].Mappings {
-		this.types = append(this.types, k)
-	}
-	metaVal := meta[indexName]
-	// clear aliases
-	metaVal.Aliases = map[string]Any{} // clear all aliases
-	meta[indexName] = metaVal
-	log.Printf("%v", this.types)
-	if resp.StatusCode >= 400 {
-		log.Fatalf("Elastic error[%s]: %s", resp.Status, string(data))
-	}
-	data, err = json.Marshal(meta)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func (this Scroll) Next() ([]map[string]Any, error) {
-	resp, err := this.es.client.Get(this.es.hostPrefix + "/_search/scroll?scroll=5m&scroll_id=" + this.id)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	data, errRead := ioutil.ReadAll(resp.Body)
-	if errRead != nil {
-		return nil, errRead
-	}
-
-	hits := struct {
-		Hits struct {
-			Hits []map[string]Any `json:"hits"`
-		} `json:"hits"`
-	}{}
-	json.Unmarshal(data, &hits)
-	return hits.Hits.Hits, errRead
-}
-
-func (this *EsConn) readBulk(typeName string, window int, dest chan []string) error {
-	log.Printf("Exporting type: `%s`", typeName)
-	scroll, err := this.NewScroll(typeName, window)
+	err = sink.PutIndex(index, p.repls, p.shards)
 	if err != nil {
 		return err
 	}
-
-	template := `{ "create" : { "_id" : "%v", "_type": "%v" } }` + "\n%s\n"
-	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
-		batch := []string{}
-		log.Printf("Exported %d\n", len(hits))
-		for _, h := range hits {
-			bytes, err := json.Marshal(h["_source"])
-			if err != nil {
-				return err
-			}
-			// create is faster then index but must avoid collision (index is empty at start)
-			bulk := fmt.Sprintf(template, h["_id"], typeName, string(bytes))
-			batch = append(batch, bulk)
-		}
-		dest <- batch
-	}
-	return nil
+	pipe := make(chan []Bulk, 10)
+	go src.StreamTo(p.window, pipe)
+	return sink.AcceptFrom(pipe)
 }
 
-func (this *EsConn) StreamTo(window int, dest chan []string) (err error) {
-	defer close(dest)
-	for _, t := range this.types {
-		err = this.readBulk(t, window, dest)
-		if err != nil {
-			panic(err)
-		}
-	}
-	return
-}
-
-func (this *EsConn) AcceptFrom(src chan []string) (err error) {
-	for batch := range src {
-		err = this.Bulk(batch)
-		if err != nil {
-			panic(err)
-		}
-		log.Printf("Imported %d", len(batch))
-	}
-	return
-}
-
-func Reader(src *bufio.Reader, window int, dest chan []string) {
-	defer close(dest)
-	batch := []string{}
-	for {
-		item, err := src.ReadString('\n')
-		if err == io.EOF {
-			if len(batch) > 0 {
-				dest <- batch
-			}
-			break
-		}
-		batch = append(batch, item)
-		if len(batch) == window*2 {
-			dest <- batch
-			batch = []string{}
-		}
-	}
-}
-
-func Writer(src chan []string, sink io.Writer) (err error) {
-	for batch := range src {
-		for _, b := range batch {
-			_, err = io.WriteString(sink, b)
-			if err != nil {
-				return
-			}
-		}
-	}
-	return
-}
-
-func exportTask(p Params) error {
+func exportTask(p Params) (err error) {
 	log.Printf("Export %s --> %s\n", p.in, p.out)
 	if !p.force {
 		_, err := os.Open(p.out)
@@ -366,52 +105,28 @@ func exportTask(p Params) error {
 			log.Fatalf("File `%s` already exits, use --force to overwrite.", p.out)
 		}
 	}
-	sink, err := os.Create(p.out)
+	sink, err := NewFileSink(p.out)
 	if err != nil {
-		return err
+		return
 	}
-	defer sink.Close()
 	es, err := ConnectES(p.in)
 	if err != nil {
-		return err
+		return
 	}
-	index, err := es.GetIndex()
-	if err != nil {
-		return err
-	}
-	_, err = sink.WriteString(index + "\n")
-	if err != nil {
-		return err
-	}
-
-	pipe := make(chan []string, 10)
-	go es.StreamTo(p.window, pipe)
-	return Writer(pipe, sink)
+	return Copy(es, sink, p)
 }
 
 func importTask(p Params) (err error) {
 	log.Printf("Import %s --> %s", p.in, p.out)
-	src, err := os.Open(p.in)
+	src, err := NewFileSource(p.in)
 	if err != nil {
 		return
 	}
-	defer src.Close()
-	reader := bufio.NewReader(src)
-	index, err := reader.ReadString('\n')
 	es, err := ConnectES(p.out)
 	if err != nil {
 		return
 	}
-	if p.force {
-		_ = es.DeleteIndex()
-	}
-	err = es.PutIndex(index, p.repls, p.shards)
-	if err != nil {
-		return
-	}
-	pipe := make(chan []string, 10)
-	go Reader(reader, p.window, pipe)
-	return es.AcceptFrom(pipe)
+	return Copy(src, es, p)
 }
 
 func copyTask(p Params) (err error) {
@@ -424,20 +139,7 @@ func copyTask(p Params) (err error) {
 	if err != nil {
 		return
 	}
-	index, err := es1.GetIndex()
-	if err != nil {
-		return
-	}
-	if p.force {
-		_ = es2.DeleteIndex()
-	}
-	err = es2.PutIndex(index, p.repls, p.shards)
-	if err != nil {
-		return
-	}
-	pipe := make(chan []string, 10)
-	go es1.StreamTo(p.window, pipe)
-	return es2.AcceptFrom(pipe)
+	return Copy(es1, es2, p)
 }
 
 type Params struct {
