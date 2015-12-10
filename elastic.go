@@ -11,6 +11,7 @@ import (
 	neturl "net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Connection to a specific index in ES
@@ -58,8 +59,13 @@ func parseBulkFailures(resp []byte) (fails map[string]bool, err error) {
 	if respObj.Errors {
 		for _, item := range respObj.Items {
 			if item.Create.Status != 201 {
-				fmt.Println(item.Create.Status)
-				fails[item.Create.Id] = true
+				if item.Create.Status == 429 || item.Create.Status == 503 {
+					fails[item.Create.Id] = true
+				} else if item.Create.Status == 409 {
+					// ignore already exists error
+				} else {
+					log.Printf("Failed %s with %d", item.Create.Id, item.Create.Status)
+				}
 			}
 		}
 	}
@@ -111,6 +117,27 @@ func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err err
 	}
 	scroll = Scroll{id: scrollID, es: this}
 	return
+}
+
+func (this *Scroll) Next() ([]map[string]Any, error) {
+	resp, err := this.es.client.Get(this.es.hostPrefix + "/_search/scroll?scroll=5m&scroll_id=" + this.id)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, errRead := ioutil.ReadAll(resp.Body)
+	if errRead != nil {
+		return nil, errRead
+	}
+
+	hits := struct {
+		Hits struct {
+			Hits []map[string]Any `json:"hits"`
+		} `json:"hits"`
+	}{}
+	json.Unmarshal(data, &hits)
+	return hits.Hits.Hits, errRead
 }
 
 // returns failed bulk ops if any single one failed; error on major filure
@@ -233,34 +260,13 @@ func (this *EsConn) GetIndex() (string, error) {
 	return string(data), nil
 }
 
-func (this *Scroll) Next() ([]map[string]Any, error) {
-	resp, err := this.es.client.Get(this.es.hostPrefix + "/_search/scroll?scroll=5m&scroll_id=" + this.id)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	data, errRead := ioutil.ReadAll(resp.Body)
-	if errRead != nil {
-		return nil, errRead
-	}
-
-	hits := struct {
-		Hits struct {
-			Hits []map[string]Any `json:"hits"`
-		} `json:"hits"`
-	}{}
-	json.Unmarshal(data, &hits)
-	return hits.Hits.Hits, errRead
-}
-
-func (this *EsConn) readBulk(typeName string, window int, dest chan<- []Bulk) {
+func (this *EsConn) readBulk(typeName string, window, bulkSize int, dest chan<- []Bulk) {
 	log.Printf("Exporting type: `%s`", typeName)
 	scroll, err := this.NewScroll(typeName, window)
 	if err != nil {
 		panic(err)
 	}
-	batcher := Batcher{size: window, dest: dest}
+	batcher := Batcher{size: bulkSize, dest: dest}
 	defer batcher.Flush()
 	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
 		log.Printf("Fetched %d\n", len(hits))
@@ -274,21 +280,38 @@ func (this *EsConn) readBulk(typeName string, window int, dest chan<- []Bulk) {
 	}
 }
 
-func (this *EsConn) StreamTo(window int, dest chan []Bulk) {
+func (this *EsConn) StreamTo(window, bulkSize int, dest chan []Bulk) {
 	defer close(dest)
 	for _, t := range this.types {
-		this.readBulk(t, window, dest)
+		this.readBulk(t, window, bulkSize, dest)
 	}
 	return
 }
 
-func (this *EsConn) AcceptFrom(src chan []Bulk) (err error) {
-	for batch := range src {
-		_, err := this.Bulk(batch)
-		if err != nil {
-			panic(err)
-		}
-		log.Printf("Imported %d", len(batch))
+func (this *EsConn) AcceptFrom(parallel int, src chan []Bulk) (err error) {
+	var group sync.WaitGroup
+	group.Add(parallel)
+	for i := 0; i < parallel; i++ {
+		go func() {
+			var leftover []Bulk
+			for batch := range src {
+				batch = append(batch, leftover...)
+				leftover, err = this.Bulk(batch)
+				if err != nil {
+					panic(err)
+				}
+				log.Printf("Imported %d/%d", len(batch)-len(leftover), len(batch))
+			}
+			for len(leftover) > 0 {
+				log.Printf("Pushing in last %d", len(leftover))
+				leftover, err = this.Bulk(leftover)
+				if err != nil {
+					panic(err)
+				}
+			}
+			group.Done()
+		}()
 	}
+	group.Wait()
 	return
 }

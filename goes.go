@@ -66,13 +66,13 @@ type IndexSettings struct {
 
 type DataSource interface {
 	GetIndex() (string, error)
-	StreamTo(window int, dest chan []Bulk)
+	StreamTo(window, batchSize int, dest chan []Bulk)
 }
 
 type DataSink interface {
 	PutIndex(meta string, repls, shards int) error
 	DeleteIndex() error
-	AcceptFrom(src chan []Bulk) error
+	AcceptFrom(parallel int, src chan []Bulk) error
 }
 
 type DataFlow interface {
@@ -93,8 +93,8 @@ func Copy(src DataSource, sink DataSink, p Params) error {
 		return err
 	}
 	pipe := make(chan []Bulk, 10)
-	go src.StreamTo(p.window, pipe)
-	return sink.AcceptFrom(pipe)
+	go src.StreamTo(p.window, p.bulk, pipe)
+	return sink.AcceptFrom(p.parallel, pipe)
 }
 
 func exportTask(p Params) (err error) {
@@ -143,12 +143,14 @@ func copyTask(p Params) (err error) {
 }
 
 type Params struct {
-	in     string
-	out    string
-	window int
-	repls  int
-	shards int
-	force  bool
+	in       string
+	out      string
+	window   int
+	bulk     int
+	parallel int
+	repls    int
+	shards   int
+	force    bool
 }
 
 type Command func(Params) error
@@ -172,6 +174,8 @@ func main() {
 	output := commands.String("out", "", "output path/URL")
 	force := commands.Bool("force", false, "force overwrite of existing index/file")
 	window := commands.Int("window", 100, "size of scroll/scan window")
+	bulk := commands.Int("bulk", 100, "size of batch")
+	parallel := commands.Int("parallel", 10, "number of parallel HTTP bulk clients")
 	repls := commands.Int("repls", -1, "override number of relicas (import only)")
 	shards := commands.Int("shards", -1, "override number of shards (import only)")
 
@@ -194,7 +198,11 @@ func main() {
 	if *output == "" {
 		log.Fatalf("No out param provided")
 	}
-	err := task(Params{in: *input, out: *output, window: *window, force: *force, repls: *repls, shards: *shards})
+	err := task(Params{
+		in: *input, out: *output, window: *window, bulk: *bulk, parallel: *parallel,
+		force: *force, repls: *repls, shards: *shards,
+	},
+	)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -53,10 +53,10 @@ func (this *FileSource) GetIndex() (string, error) {
 	return this.reader.ReadString('\n')
 }
 
-func (this *FileSource) StreamTo(window int, dest chan []Bulk) {
+func (this *FileSource) StreamTo(window, bulkSize int, dest chan []Bulk) {
 	defer close(dest)
 	defer this.src.Close()
-	batcher := Batcher{size: window, dest: dest}
+	batcher := Batcher{size: bulkSize, dest: dest}
 	defer batcher.Flush()
 	for {
 		bulk, err := ParseBulk(this.reader)
@@ -88,7 +88,7 @@ func (this *FileSink) PutIndex(meta string, repls, shards int) error {
 	return err
 }
 
-func (this *FileSink) AcceptFrom(src chan []Bulk) error {
+func (this *FileSink) AcceptFrom(parallel int, src chan []Bulk) error {
 	defer this.sink.Close()
 	for batch := range src {
 		for _, b := range batch {
