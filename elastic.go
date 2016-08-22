@@ -43,6 +43,7 @@ func readRequest(client *http.Client, req *http.Request) (body []byte, err error
 
 // set of _id that failed with anything but document exists
 func parseBulkFailures(resp []byte) (fails map[string]bool, err error) {
+	fails = map[string]bool{}
 	var respObj struct {
 		Errors bool `json:"errors"`
 		Items  []struct {
