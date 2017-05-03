@@ -88,9 +88,13 @@ func Copy(src DataSource, sink DataSink, p Params) error {
 	if p.force {
 		sink.DeleteIndex()
 	}
-	err = sink.PutIndex(index, p.repls, p.shards)
-	if err != nil {
-		return err
+	if !p.skipCreate {
+		err = sink.PutIndex(index, p.repls, p.shards)
+		if err != nil {
+			return err
+		}
+	}else{
+		log.Print("Skipped index creation (-skipCreate flag passed)")
 	}
 	pipe := make(chan []Bulk, 10)
 	go src.StreamTo(p.window, p.bulk, pipe)
@@ -143,14 +147,15 @@ func copyTask(p Params) (err error) {
 }
 
 type Params struct {
-	in       string
-	out      string
-	window   int
-	bulk     int
-	parallel int
-	repls    int
-	shards   int
-	force    bool
+	in         string
+	out        string
+	window     int
+	bulk       int
+	parallel   int
+	repls      int
+	shards     int
+	force      bool
+	skipCreate bool
 }
 
 type Command func(Params) error
@@ -178,6 +183,7 @@ func main() {
 	parallel := commands.Int("parallel", 10, "number of parallel HTTP bulk clients")
 	repls := commands.Int("repls", -1, "override number of relicas (import only)")
 	shards := commands.Int("shards", -1, "override number of shards (import only)")
+	skipCreate := commands.Bool("skipCreate", false, "Skipping createing indx in elastic (import and copy only)")
 
 	if len(args) == 1 {
 		log.Printf("No command supplied, valid commands :\n")
@@ -200,7 +206,7 @@ func main() {
 	}
 	err := task(Params{
 		in: *input, out: *output, window: *window, bulk: *bulk, parallel: *parallel,
-		force: *force, repls: *repls, shards: *shards,
+		force: *force, repls: *repls, shards: *shards, skipCreate: *skipCreate,
 	},
 	)
 	if err != nil {
