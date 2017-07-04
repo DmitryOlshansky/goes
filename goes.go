@@ -52,15 +52,9 @@ func (this *Batcher) Flush() {
 
 type IndexSettings struct {
 	Index struct {
-		Cache      Any    `json:"cache"`
 		NumShards  string `json:"number_of_shards"`
 		NumRepls   string `json:"number_of_replicas"`
 		Refresh    Any    `json:"refresh_interval"`
-		Similarity Any    `json:"similarity"`
-		Analysis   Any    `json:"analysis"`
-		TransLog   Any    `json:"translog"`
-		Uuid       Any    `json:"uuid"`
-		Version    Any    `json:"version"`
 	} `json:"index"`
 }
 

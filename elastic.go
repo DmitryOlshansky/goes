@@ -22,6 +22,12 @@ type EsConn struct {
 	client     *http.Client
 }
 
+type EsReply struct {
+	Hits struct {
+		Hits []map[string]Any `json:"hits"`
+	} `json:"hits"`
+}
+
 var _ DataFlow = &EsConn{}
 
 // http helper - check status and read the whole response body
@@ -85,7 +91,7 @@ func ConnectES(url string) (*EsConn, error) {
 	return &EsConn{hostPrefix: hostPrefix, path: u.Path, client: http.DefaultClient}, nil
 }
 
-func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err error) {
+func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, hits []map[string]Any, err error) {
 	query := fmt.Sprintf(`
         {
             "query": {
@@ -94,7 +100,8 @@ func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err err
             "size": %d
         }
     `, size)
-	url := fmt.Sprintf("%s%s/%s/_search?search_type=scan&scroll=5m", this.hostPrefix, this.path, typeName)
+
+	url := fmt.Sprintf("%s%s/%s/_search?scroll=5m", this.hostPrefix, this.path, typeName)
 	request, err := http.NewRequest("GET", url, bytes.NewBufferString(query))
 	if err != nil {
 		return
@@ -104,15 +111,18 @@ func (this *EsConn) NewScroll(typeName string, size int) (scroll Scroll, err err
 		return
 	}
 	//
-	getScrollId := func(data []byte) (string, error) {
+	getScrollId := func(data []byte) (string, []map[string]Any, error) {
 		v := struct {
 			ScrollID string `json:"_scroll_id"`
+			Hits struct {
+				Hits []map[string]Any `json:"hits"`
+			} `json:"hits"`
 		}{}
 		err := json.Unmarshal(data, &v)
-		return v.ScrollID, err
+		return v.ScrollID, v.Hits.Hits, err
 	}
 
-	scrollID, err := getScrollId(resp)
+	scrollID, hits, err := getScrollId(resp)
 	if err != nil {
 		return
 	}
@@ -132,11 +142,7 @@ func (this *Scroll) Next() ([]map[string]Any, error) {
 		return nil, errRead
 	}
 
-	hits := struct {
-		Hits struct {
-			Hits []map[string]Any `json:"hits"`
-		} `json:"hits"`
-	}{}
+	hits := EsReply{}
 	json.Unmarshal(data, &hits)
 	return hits.Hits.Hits, errRead
 }
@@ -263,12 +269,20 @@ func (this *EsConn) GetIndex() (string, error) {
 
 func (this *EsConn) readBulk(typeName string, window, bulkSize int, dest chan<- []Bulk) {
 	log.Printf("Exporting type: `%s`", typeName)
-	scroll, err := this.NewScroll(typeName, window)
+	scroll, hits, err := this.NewScroll(typeName, window)
 	if err != nil {
 		panic(err)
 	}
 	batcher := Batcher{size: bulkSize, dest: dest}
 	defer batcher.Flush()
+	log.Printf("Fetched %d\n", len(hits))
+	for _, h := range hits {
+		bytes, err := json.Marshal(h["_source"])
+		if err != nil {
+			panic(err)
+		}
+		batcher.Put(Bulk{Id: h["_id"].(string), Type: typeName, Doc: bytes})
+	}
 	for hits, err := scroll.Next(); len(hits) != 0 && err == nil; hits, err = scroll.Next() {
 		log.Printf("Fetched %d\n", len(hits))
 		for _, h := range hits {
