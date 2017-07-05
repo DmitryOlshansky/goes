@@ -208,7 +208,7 @@ func (this *EsConn) PutIndex(metaString string, repls int, shards int) (err erro
 	if repls >= 0 {
 		metaVal.Settings.Index.NumRepls = strconv.Itoa(repls)
 	}
-	if repls >= 0 {
+	if shards >= 0 {
 		metaVal.Settings.Index.NumShards = strconv.Itoa(shards)
 	}
 
